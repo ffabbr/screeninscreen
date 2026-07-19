@@ -1,0 +1,13 @@
+# Built app (created on demand in project root)
+ScreenInScreen.app/
+*.app/
+
+# Xcode / build artifacts
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.o
+*.swiftmodule
+*.swiftdoc
+.DS_Store
