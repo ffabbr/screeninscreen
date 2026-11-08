@@ -23,7 +23,8 @@ A tiny macOS utility that mirrors an external monitor in a resizable window.
 | Control the monitor     | **Click / drag / scroll inside the preview** — it lands on the mirrored monitor |
 | Toggle click-through    | **Right-click** menu bar icon → **Click Through to Monitor** |
 | Presenter mode          | **Right-click** menu bar icon → **Presenter Mode (Mac → Monitor)** |
-| Hide windows from audience | **Right-click** menu bar icon → **Choose Hidden Windows…** |
+| Hide windows from audience | **Right-click** menu bar icon → **Settings…** |
+| Pin hidden windows on top (click-through) | Your recorded shortcut, **or** right-click → **Pin Windows** |
 | Quit ScreenInScreen     | **Right-click** menu bar icon → **Quit ScreenInScreen**    |
 
 *Window size & position are remembered across launches.*
@@ -47,7 +48,23 @@ on the external display, and a floating **Hidden Windows** checklist opens:
 tick a window and it vanishes from the audience's view instantly (it stays
 visible to you). New windows appear in the mirror automatically; the checklist
 refreshes itself. ScreenInScreen's own windows are never shown to the
-audience. Turn the mode off via the same menu item, or it ends automatically
+audience.
+
+Ticked windows turn slightly **see-through on your own screen** — right away,
+even before presenter mode is on — so you can tell at a glance what the
+audience can't see. Set how see-through with the
+**See-through on your screen** slider at the top of the Hidden Windows panel
+(0 % = off, up to 90 %). Clicks still go to the window as normal.
+
+**Pin on top, click-through.** Record a shortcut under **Pin on top,
+click-through** in the Hidden Windows panel (click the button, press the
+keys; ⌫ removes it, Esc cancels). Pressing it pins every ticked window: it
+stays visible exactly where it was and floats above everything, but clicks and
+scrolls go straight through to whatever is behind it — even when that window
+becomes active. Press the shortcut again (or use **Pin Windows**
+in the menu) to unpin. Under the hood the real window is moved into a screen
+corner while a live copy is shown in its place; it is moved back when you
+unpin or quit. Needs **Accessibility** access. Turn the mode off via the same menu item, or it ends automatically
 when the monitor is unplugged.
 
 *The ⌥B shortcut works app-wide once macOS grants **Accessibility** access

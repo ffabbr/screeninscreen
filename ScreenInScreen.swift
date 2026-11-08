@@ -61,6 +61,20 @@ enum DisplayHelper {
 
 // MARK: – Frame relay --------------------------------------------------------
 
+extension CMSampleBuffer {
+    /// ScreenCaptureKit also emits "idle"/"blank" frames when nothing
+    /// changed — only `.complete` frames carry a new image worth showing.
+    var isCompleteScreenFrame: Bool {
+        guard isValid else { return false }
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(self, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+           let raw = attachments.first?[.status] as? Int,
+           SCFrameStatus(rawValue: raw) != .complete {
+            return false
+        }
+        return true
+    }
+}
+
 /// Renders SCStream sample buffers off the main thread and hands the newest
 /// frame to a CALayer, coalescing so a slow main thread can never accumulate
 /// an unbounded backlog of stale frames.
@@ -90,15 +104,7 @@ final class FrameRelay {
 
     /// Call from the stream's sample-handler queue.
     func handle(_ sb: CMSampleBuffer) {
-        guard sb.isValid, let buf = sb.imageBuffer else { return }
-
-        // ScreenCaptureKit also emits "idle"/"blank" frames when nothing
-        // changed — rendering those is pure waste.
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-           let raw = attachments.first?[.status] as? Int,
-           SCFrameStatus(rawValue: raw) != .complete {
-            return
-        }
+        guard sb.isCompleteScreenFrame, let buf = sb.imageBuffer else { return }
 
         var ciImg = CIImage(cvImageBuffer: buf)
 
@@ -146,6 +152,45 @@ final class FrameRelay {
     }
 }
 
+/// Hands the newest frame of a stream to the main thread as a bare IOSurface.
+/// The surface goes straight into a layer's `contents` — no copy, no CPU
+/// readback — and delivery is coalesced so a busy main thread only ever
+/// sees the newest frame.
+final class SurfaceRelay {
+    private let lock = NSLock()
+    private var pending: IOSurface?
+    private var scheduled = false
+    private let deliver: (IOSurface) -> Void
+
+    /// `deliver` runs on the main thread.
+    init(deliver: @escaping (IOSurface) -> Void) { self.deliver = deliver }
+
+    /// Call from the stream's sample-handler queue.
+    func handle(_ sb: CMSampleBuffer) {
+        guard sb.isCompleteScreenFrame,
+              let buffer = sb.imageBuffer,
+              let surface = CVPixelBufferGetIOSurface(buffer)?.takeUnretainedValue()
+        else { return }
+
+        lock.lock()
+        pending = surface
+        let needsSchedule = !scheduled
+        scheduled = true
+        lock.unlock()
+        guard needsSchedule else { return }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let next = self.pending
+            self.pending = nil
+            self.scheduled = false
+            self.lock.unlock()
+            if let next { self.deliver(next) }
+        }
+    }
+}
+
 // MARK: – Accessibility helper ----------------------------------------------
 
 enum Accessibility {
@@ -161,6 +206,141 @@ enum Accessibility {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
+    }
+}
+
+// MARK: – Keyboard shortcuts --------------------------------------------------
+
+/// A user-recorded key combination, stored in UserDefaults.
+struct KeyShortcut: Equatable {
+    let keyCode: UInt32
+    let carbonModifiers: UInt32
+    let display: String          // e.g. "⌃⌥P", captured at record time
+
+    private static let functionKeys: [Int: String] = [
+        kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4", kVK_F5: "F5",
+        kVK_F6: "F6", kVK_F7: "F7", kVK_F8: "F8", kVK_F9: "F9", kVK_F10: "F10",
+        kVK_F11: "F11", kVK_F12: "F12", kVK_F13: "F13", kVK_F14: "F14",
+        kVK_F15: "F15", kVK_F16: "F16", kVK_F17: "F17", kVK_F18: "F18",
+        kVK_F19: "F19", kVK_F20: "F20",
+    ]
+    private static let namedKeys: [Int: String] = [
+        kVK_Space: "Space", kVK_Return: "↩", kVK_Tab: "⇥",
+        kVK_LeftArrow: "←", kVK_RightArrow: "→", kVK_UpArrow: "↑", kVK_DownArrow: "↓",
+        kVK_Home: "↖", kVK_End: "↘", kVK_PageUp: "⇞", kVK_PageDown: "⇟",
+    ]
+
+    /// Nil for combinations that would clash with ordinary typing: a plain
+    /// letter or a ⇧-letter must not become a global hotkey. Function keys
+    /// are fine on their own — handy on a presentation remote.
+    init?(event: NSEvent) {
+        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let code = Int(event.keyCode)
+        let isFunctionKey = Self.functionKeys[code] != nil
+        guard isFunctionKey || !flags.intersection([.command, .option, .control]).isEmpty else { return nil }
+
+        let key: String
+        if let name = Self.functionKeys[code] ?? Self.namedKeys[code] {
+            key = name
+        } else if let chars = event.characters(byApplyingModifiers: []), !chars.isEmpty,
+                  !chars.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+            key = chars.uppercased()
+        } else {
+            return nil
+        }
+
+        var symbols = ""
+        var carbon: UInt32 = 0
+        if flags.contains(.control) { symbols += "⌃"; carbon |= UInt32(controlKey) }
+        if flags.contains(.option)  { symbols += "⌥"; carbon |= UInt32(optionKey) }
+        if flags.contains(.shift)   { symbols += "⇧"; carbon |= UInt32(shiftKey) }
+        if flags.contains(.command) { symbols += "⌘"; carbon |= UInt32(cmdKey) }
+        self.init(keyCode: UInt32(code), carbonModifiers: carbon, display: symbols + key)
+    }
+
+    init(keyCode: UInt32, carbonModifiers: UInt32, display: String) {
+        self.keyCode = keyCode
+        self.carbonModifiers = carbonModifiers
+        self.display = display
+    }
+
+    static func load(_ key: String) -> KeyShortcut? {
+        guard let d = UserDefaults.standard.dictionary(forKey: key),
+              let code = d["keyCode"] as? Int, let mods = d["modifiers"] as? Int,
+              let display = d["display"] as? String else { return nil }
+        return KeyShortcut(keyCode: UInt32(code), carbonModifiers: UInt32(mods), display: display)
+    }
+
+    static func save(_ shortcut: KeyShortcut?, _ key: String) {
+        guard let s = shortcut else { UserDefaults.standard.removeObject(forKey: key); return }
+        UserDefaults.standard.set(["keyCode": Int(s.keyCode), "modifiers": Int(s.carbonModifiers),
+                                   "display": s.display], forKey: key)
+    }
+}
+
+private func hotKeyEventHandler(_ next: EventHandlerCallRef?, _ event: EventRef?,
+                                _ userData: UnsafeMutableRawPointer?) -> OSStatus {
+    guard let event else { return OSStatus(eventNotHandledErr) }
+    var hotKeyID = EventHotKeyID()
+    let status = GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                                   EventParamType(typeEventHotKeyID), nil,
+                                   MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
+    guard status == noErr else { return status }
+    GlobalHotKey.fire(hotKeyID.id)
+    return noErr
+}
+
+/// A true system-wide hotkey (Carbon `RegisterEventHotKey`). Unlike an
+/// NSEvent global monitor it needs no Accessibility access, and it *consumes*
+/// the keystroke — the frontmost app never sees it.
+final class GlobalHotKey {
+    private static var handlers: [UInt32: () -> Void] = [:]
+    private static var nextID: UInt32 = 1
+    private static var handlerInstalled = false
+
+    private let id: UInt32
+    private var ref: EventHotKeyRef?
+
+    init(action: @escaping () -> Void) {
+        id = Self.nextID
+        Self.nextID += 1
+        Self.handlers[id] = action
+        Self.installHandlerOnce()
+    }
+
+    deinit {
+        unregister()
+        Self.handlers[id] = nil
+    }
+
+    fileprivate static func fire(_ id: UInt32) { handlers[id]?() }
+
+    private static func installHandlerOnce() {
+        guard !handlerInstalled else { return }
+        handlerInstalled = true
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), hotKeyEventHandler, 1, &spec, nil, nil)
+    }
+
+    /// Replaces any previous binding. False if the combination is taken
+    /// (another app registered it first).
+    @discardableResult
+    func register(_ shortcut: KeyShortcut) -> Bool {
+        unregister()
+        let hotKeyID = EventHotKeyID(signature: OSType(0x5349_5348), id: id)   // 'SISH'
+        let status = RegisterEventHotKey(shortcut.keyCode, shortcut.carbonModifiers, hotKeyID,
+                                         GetApplicationEventTarget(), 0, &ref)
+        if status != noErr {
+            NSLog("ScreenInScreen: could not register hotkey %@ (%d)", shortcut.display, status)
+            ref = nil
+        }
+        return status == noErr
+    }
+
+    func unregister() {
+        if let ref { UnregisterEventHotKey(ref) }
+        ref = nil
     }
 }
 
@@ -354,11 +534,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if hidden { ids.insert(id) } else { ids.remove(id) }
             self.presenter.setHidden(ids)
         }
+        picker.transparency = { [weak self] in self?.presenter.hiddenWindowTransparency ?? 0 }
+        picker.onTransparencyChange = { [weak self] value in
+            self?.presenter.hiddenWindowTransparency = value
+        }
+        picker.pinShortcut = { KeyShortcut.load(Self.pinShortcutDefaultsKey) }
+        picker.onPinShortcutChange = { [weak self] shortcut in
+            guard let self else { return false }
+            if let shortcut, !self.pinHotKey.register(shortcut) { return false }
+            if shortcut == nil { self.pinHotKey.unregister() }
+            KeyShortcut.save(shortcut, Self.pinShortcutDefaultsKey)
+            return true
+        }
+        picker.onRecordingShortcut = { [weak self] recording in
+            guard let self else { return }
+            if recording {
+                self.pinHotKey.unregister()
+            } else if let stored = KeyShortcut.load(Self.pinShortcutDefaultsKey) {
+                self.pinHotKey.register(stored)
+            }
+        }
         return picker
     }()
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var trustPollTimer: Timer?
+    private static let pinShortcutDefaultsKey = "PinHiddenWindowsShortcut"
+    private lazy var pinHotKey = GlobalHotKey { [weak self] in self?.togglePinned() }
 
     func applicationDidFinishLaunching(_ n: Notification) {
 
@@ -375,6 +577,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         mirror.showWindow()
         registerHotkey()
+        if let shortcut = KeyShortcut.load(Self.pinShortcutDefaultsKey) { pinHotKey.register(shortcut) }
         ensureAccessibility()
     }
 
@@ -385,6 +588,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         localMonitor = nil
         trustPollTimer?.invalidate()
         trustPollTimer = nil
+        presenter.setPinned(false)   // never leave windows parked in a corner
         presenter.stop()
         mirror.shutDown()
     }
@@ -434,8 +638,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                        action: #selector(togglePresenter), keyEquivalent: "")
         presenterItem.state = presenter.isActive ? .on : .off
         menu.addItem(presenterItem)
-        menu.addItem(NSMenuItem(title: "Choose Hidden Windows…",
+        menu.addItem(NSMenuItem(title: "Settings…",
                                 action: #selector(showWindowPicker), keyEquivalent: ""))
+        var pinTitle = "Pin Windows"
+        if let shortcut = KeyShortcut.load(Self.pinShortcutDefaultsKey) { pinTitle += "  (\(shortcut.display))" }
+        let pinItem = NSMenuItem(title: pinTitle, action: #selector(togglePinned), keyEquivalent: "")
+        pinItem.state = presenter.isPinned ? .on : .off
+        menu.addItem(pinItem)
 
         menu.addItem(.separator())
 
@@ -476,6 +685,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showWindowPicker() { windowPicker.show() }
+
+    /// Pinning moves the real windows aside via Accessibility — without it
+    /// the copies would sit on top of windows that still catch every click.
+    @objc private func togglePinned() {
+        if presenter.isPinned {
+            presenter.setPinned(false)
+            return
+        }
+        guard Accessibility.trusted else {
+            NSSound.beep()
+            ensureAccessibility()
+            return
+        }
+        guard !presenter.hiddenWindowIDs.isEmpty else {
+            NSSound.beep()   // nothing ticked — nothing to pin
+            return
+        }
+        presenter.setPinned(true)
+    }
     @objc private func quit() { NSApp.terminate(nil) }
 
     @objc private func toggleClickThrough() {
@@ -912,6 +1140,27 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
     /// survive an app relaunch, so persisting them would silently un-hide.
     private(set) var hiddenWindowIDs: Set<CGWindowID> = []
 
+    /// How see-through hidden windows look on the presenter's own screen
+    /// (0 = normal, opaque). Purely local — the audience never sees them.
+    static let maxHiddenWindowTransparency: CGFloat = 0.9
+    private static let transparencyDefaultsKey = "HiddenWindowTransparency"
+    var hiddenWindowTransparency: CGFloat {
+        didSet {
+            UserDefaults.standard.set(Double(hiddenWindowTransparency), forKey: Self.transparencyDefaultsKey)
+            veil.transparency = hiddenWindowTransparency
+            pinner.alpha = 1 - hiddenWindowTransparency
+            // Crossing zero starts/stops the veil's capture; any other change
+            // is just an alpha tweak on the existing overlays.
+            if (oldValue > 0) != (hiddenWindowTransparency > 0) { refreshVeil() }
+        }
+    }
+    private let veil = HiddenWindowVeil()
+    private var veilGeneration = 0
+
+    /// Hidden windows pinned on top, click-through (session-only state).
+    private(set) var isPinned = false
+    private let pinner = WindowPinner()
+
     private var outputWindow: NSWindow?
     private let contentLayer = CALayer()
     private lazy var relay = FrameRelay(layer: contentLayer)
@@ -919,7 +1168,15 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
     private let sampleQueue = DispatchQueue(label: "app.screeninscreen.presenter", qos: .userInitiated)
 
     override init() {
+        UserDefaults.standard.register(defaults: [Self.transparencyDefaultsKey: 0.3])
+        let stored = CGFloat(UserDefaults.standard.double(forKey: Self.transparencyDefaultsKey))
+        hiddenWindowTransparency = min(max(stored, 0), Self.maxHiddenWindowTransparency)
         super.init()
+        veil.transparency = hiddenWindowTransparency
+        pinner.alpha = 1 - hiddenWindowTransparency
+        // A window parked or returned: the veil must stop/start covering it,
+        // and the new overlay must be swept into the capture exclusions.
+        pinner.onChange = { [weak self] in self?.refreshCaptureFilters() }
         contentLayer.contentsGravity = .resize
         contentLayer.magnificationFilter = .trilinear
         contentLayer.minificationFilter = .trilinear
@@ -974,11 +1231,51 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
     func setHidden(_ ids: Set<CGWindowID>) {
         guard ids != hiddenWindowIDs else { return }
         hiddenWindowIDs = ids
+        if isPinned { pinner.setTargets(ids) }   // newly ticked windows pin too
+        refreshCaptureFilters()
+    }
+
+    /// Pin the hidden windows on top, click-through — or put them back.
+    func setPinned(_ pinned: Bool) {
+        isPinned = pinned
+        pinner.setTargets(pinned ? hiddenWindowIDs : [])
+    }
+
+    /// Rebuild the veil's and the audience stream's filters from the current
+    /// window set (our own windows, incl. fresh overlays, are excluded).
+    private func refreshCaptureFilters() {
+        refreshVeil()
         guard isActive, let s = stream else { return }
         Task { [weak self] in
             guard let self, let filter = await self.makeFilter() else { return }
             do { try await s.updateContentFilter(filter) }
             catch { await self.startStream() }   // stream died — rebuild it
+        }
+    }
+
+    /// Bring the see-through overlays in line with the current state. The
+    /// overlays are created synchronously, *before* any capture filter is
+    /// built, so the filters' "exclude our own windows" sweep covers them.
+    ///
+    /// Deliberately independent of `isActive`: a ticked window looks
+    /// see-through as soon as it's ticked, so the user can see what *will*
+    /// be hidden before presenting (and without a monitor attached).
+    ///
+    /// Parked (pinned) windows are skipped — their pinned copy carries the
+    /// transparency instead.
+    private func refreshVeil() {
+        let targets = hiddenWindowTransparency > 0 ? hiddenWindowIDs.subtracting(pinner.parkedIDs) : []
+        veil.setTargets(targets)
+        veilGeneration += 1
+        guard !targets.isEmpty else { return }
+        let generation = veilGeneration
+        Task { [weak self] in
+            guard let self, let filter = await self.makeFilter() else { return }
+            await MainActor.run {
+                // A newer refresh overtook this one — its filter is stale.
+                guard generation == self.veilGeneration else { return }
+                self.veil.apply(filter)
+            }
         }
     }
 
@@ -1104,6 +1401,11 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Output display unplugged or resolutions changed.
     @objc private func screensChanged() {
+        // The built-in screen's resolution may have changed — rebuild the
+        // veil's capture from scratch (rare event, simplest correct path).
+        veil.setTargets([])
+        refreshVeil()
+
         guard isActive else { return }
         guard let out = outputDisplayID,
               let screen = DisplayHelper.screen(for: out),
@@ -1139,12 +1441,475 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// MARK: – Hidden-window veil --------------------------------------------------
+
+/// Makes windows hidden from the audience look see-through on the presenter's
+/// own (built-in) screen, so it's obvious at a glance what the room can't see.
+///
+/// macOS offers no public way to change another app's window alpha, so the
+/// effect is composited: a click-through overlay sits *directly* above each
+/// hidden window and shows, at partial opacity, what lies behind it — taken
+/// from a capture of the built-in screen that already excludes the hidden
+/// windows. Blending "window" with "what's behind the window" is exactly what
+/// translucency looks like. All main-thread except the sample handler.
+final class HiddenWindowVeil: NSObject, SCStreamOutput, SCStreamDelegate {
+    var transparency: CGFloat = 0 {
+        didSet { overlays.values.forEach { $0.window.alphaValue = transparency } }
+    }
+
+    private final class Overlay {
+        let window: NSWindow
+        /// Shows the whole built-in screen, positioned so that the part under
+        /// the hidden window lines up; the window's bounds clip the rest.
+        let backdrop = CALayer()
+
+        init(alpha: CGFloat, surface: IOSurface?) {
+            window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
+                              styleMask: .borderless, backing: .buffered, defer: false)
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.hasShadow = false
+            window.ignoresMouseEvents = true   // every click lands on the real window
+            window.isReleasedWhenClosed = false
+            window.animationBehavior = .none
+            window.sharingType = .none         // never in any capture — no feedback loop
+            window.alphaValue = alpha
+            window.collectionBehavior = [.transient, .ignoresCycle, .fullScreenAuxiliary]
+
+            let view = NSView()
+            view.wantsLayer = true
+            view.layer?.masksToBounds = true
+            backdrop.contentsGravity = .resize
+            backdrop.actions = ["contents": NSNull(), "bounds": NSNull(),
+                                "position": NSNull(), "frame": NSNull()]
+            backdrop.contents = surface
+            view.layer?.addSublayer(backdrop)
+            window.contentView = view
+        }
+    }
+
+    private var overlays: [CGWindowID: Overlay] = [:]
+    private var stream: SCStream?
+    private var trackTimer: Timer?
+    private var surface: IOSurface?   // newest backdrop frame (main thread)
+
+    private let sampleQueue = DispatchQueue(label: "app.screeninscreen.veil", qos: .userInitiated)
+    private lazy var relay = SurfaceRelay { [weak self] next in
+        guard let self, self.stream != nil else { return }
+        self.surface = next
+        self.overlays.values.forEach { $0.backdrop.contents = next }
+    }
+
+    // MARK: targets
+
+    /// Windows to veil. Empty stops everything. Overlays exist as soon as this
+    /// returns, so a capture filter built afterwards excludes them.
+    func setTargets(_ ids: Set<CGWindowID>) {
+        for (id, overlay) in overlays where !ids.contains(id) {
+            overlay.window.orderOut(nil)
+            overlays[id] = nil
+        }
+        for id in ids where overlays[id] == nil {
+            overlays[id] = Overlay(alpha: transparency, surface: surface)
+        }
+        if overlays.isEmpty { stop() } else { startTracking() }
+    }
+
+    /// Capture filter of the built-in screen minus the hidden windows (and
+    /// minus our own windows) — what's *behind* every hidden window.
+    func apply(_ filter: SCContentFilter) {
+        guard !overlays.isEmpty else { return }
+        if let s = stream {
+            s.updateContentFilter(filter) { [weak self] error in
+                guard error != nil else { return }
+                DispatchQueue.main.async {   // stream died — rebuild it
+                    guard let self, self.stream === s else { return }
+                    self.stream = nil
+                    self.apply(filter)
+                }
+            }
+            return
+        }
+        guard let source = DisplayHelper.builtin else { return }
+        let s = SCStream(filter: filter, configuration: makeConfiguration(for: source), delegate: self)
+        do {
+            try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
+        } catch {
+            NSLog("ScreenInScreen: veil stream error — %@", error.localizedDescription)
+            return
+        }
+        stream = s
+        s.startCapture { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    NSLog("ScreenInScreen: veil capture failed — %@", error.localizedDescription)
+                    if self.stream === s { self.stream = nil }
+                } else if self.stream !== s {
+                    s.stopCapture { _ in }   // stopped while starting up
+                }
+            }
+        }
+    }
+
+    private func stop() {
+        trackTimer?.invalidate()
+        trackTimer = nil
+        overlays.values.forEach { $0.window.orderOut(nil) }
+        overlays = [:]
+        surface = nil
+        if let s = stream {
+            stream = nil
+            s.stopCapture { _ in }
+        }
+    }
+
+    private func makeConfiguration(for display: CGDirectDisplayID) -> SCStreamConfiguration {
+        let cfg = SCStreamConfiguration()
+        // Native pixels, so the backdrop maps 1:1 onto the real screen.
+        let native = DisplayHelper.pixelSize(of: display)
+        cfg.width = Int(native.width) & ~1
+        cfg.height = Int(native.height) & ~1
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA
+        // The display's own colour space: the backdrop must match the pixels
+        // around it exactly, or the window's outline would show as a tint.
+        if let name = CGDisplayCopyColorSpace(display).name {
+            cfg.colorSpaceName = name
+        }
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        cfg.queueDepth = 4
+        cfg.showsCursor = false   // the real cursor is right there already
+        return cfg
+    }
+
+    // MARK: tracking
+
+    private func startTracking() {
+        guard trackTimer == nil else { return }
+        let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.track() }
+        RunLoop.main.add(t, forMode: .common)
+        trackTimer = t
+        track()
+    }
+
+    /// Follow each hidden window's position, level, Space and stacking order.
+    private func track() {
+        guard let source = DisplayHelper.builtin else { return }
+        let d = CGDisplayBounds(source)
+        let mainHeight = primaryDisplayHeight
+        let displayRect = NSRect(x: d.minX, y: mainHeight - d.maxY, width: d.width, height: d.height)
+
+        for (id, overlay) in overlays {
+            let w = overlay.window
+            guard let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]])?.first,
+                  (info[kCGWindowIsOnscreen as String] as? Bool) == true,
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let b = CGRect(dictionaryRepresentation: boundsDict as CFDictionary)
+            else {
+                // Closed, minimised or on another Space.
+                if w.isVisible { w.orderOut(nil) }
+                continue
+            }
+            let frame = NSRect(x: b.minX, y: mainHeight - b.maxY, width: b.width, height: b.height)
+            guard frame.intersects(displayRect) else {
+                if w.isVisible { w.orderOut(nil) }
+                continue
+            }
+
+            if w.frame != frame { w.setFrame(frame, display: false) }
+            let backdropFrame = displayRect.offsetBy(dx: -frame.minX, dy: -frame.minY)
+            if overlay.backdrop.frame != backdropFrame { overlay.backdrop.frame = backdropFrame }
+
+            let level = NSWindow.Level(rawValue: info[kCGWindowLayer as String] as? Int ?? 0)
+            if w.level != level { w.level = level }
+            // Left behind on another Space: re-ordering in moves it to this one.
+            if w.isVisible && !w.isOnActiveSpace { w.orderOut(nil) }
+            if !w.isVisible || !isDirectlyAbove(CGWindowID(w.windowNumber), id) {
+                w.order(.above, relativeTo: Int(id))
+            }
+        }
+    }
+
+    /// True when `target` is the very next on-screen window below `overlay`.
+    /// Anything in between (the user clicked another window, or the hidden
+    /// window was raised) means the overlay would be drawn over the wrong
+    /// window — or under the right one.
+    private func isDirectlyAbove(_ overlay: CGWindowID, _ target: CGWindowID) -> Bool {
+        guard let below = CGWindowListCopyWindowInfo([.optionOnScreenBelowWindow, .excludeDesktopElements],
+                                                     overlay) as? [[String: Any]],
+              let next = below.first?[kCGWindowNumber as String] as? Int
+        else { return false }
+        return CGWindowID(next) == target
+    }
+
+    // MARK: SCStreamOutput / delegate
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen else { return }
+        relay.handle(sb)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        NSLog("ScreenInScreen: veil stream stopped — %@", error.localizedDescription)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.stream === stream else { return }
+            self.stream = nil
+        }
+    }
+}
+
+// MARK: – Window pinning ------------------------------------------------------
+
+/// Private but long-stable (Rectangle, yabai, AeroSpace rely on it): the only
+/// reliable bridge from an Accessibility window element to its CGWindowID.
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+/// Pins windows "on top, click-through": the window stays visible where it
+/// was, floats above everything, and every click lands on whatever is behind
+/// it — as if it weren't there.
+///
+/// No public API can raise another app's window to a floating level or make
+/// it ignore the mouse, so the pinned window is a *live copy*: a floating,
+/// click-through overlay of ours shows a capture of the real window, while
+/// the real window is parked in a screen corner (all but one point off-screen)
+/// out of the way of clicks. Unpinning moves it back. Main thread only.
+final class WindowPinner {
+    var alpha: CGFloat = 1 {
+        didSet { pins.values.forEach { $0.overlay.alphaValue = alpha } }
+    }
+    /// Fired whenever a window was parked or came back.
+    var onChange: () -> Void = {}
+
+    /// Windows currently parked behind a pinned copy.
+    var parkedIDs: Set<CGWindowID> { Set(pins.filter { $0.value.isParked }.keys) }
+
+    private var pins: [CGWindowID: Pin] = [:]
+
+    /// Windows to pin. Windows not on screen right now (minimised, other
+    /// Space) are skipped; anything dropped from the set is put back.
+    func setTargets(_ ids: Set<CGWindowID>) {
+        var changed = false
+        for (id, pin) in pins where !ids.contains(id) {
+            changed = changed || pin.isParked
+            pin.release()
+            pins[id] = nil
+        }
+        for id in ids where pins[id] == nil {
+            guard let pin = Pin(windowID: id, alpha: alpha) else { continue }
+            pin.onParked = { [weak self] in self?.onChange() }
+            pin.onGone = { [weak self, weak pin] in
+                guard let self, let pin, self.pins[id] === pin else { return }
+                self.pins[id] = nil
+                self.onChange()
+            }
+            pins[id] = pin
+        }
+        if changed { onChange() }
+    }
+}
+
+private final class Pin: NSObject, SCStreamOutput, SCStreamDelegate {
+    let windowID: CGWindowID
+    let overlay: NSWindow
+    private(set) var isParked = false
+    var onParked: () -> Void = {}
+    var onGone: () -> Void = {}
+
+    private let element: AXUIElement
+    private let home: CGPoint          // original top-left, CG global coordinates
+    private let size: CGSize
+    private let content = CALayer()
+    private var stream: SCStream?
+    private var released = false
+    private let sampleQueue = DispatchQueue(label: "app.screeninscreen.pin", qos: .userInitiated)
+    private lazy var relay = SurfaceRelay { [weak self] surface in self?.show(surface) }
+
+    init?(windowID: CGWindowID, alpha: CGFloat) {
+        guard let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]])?.first,
+              (info[kCGWindowIsOnscreen as String] as? Bool) == true,
+              let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+              let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
+              let element = Self.axWindow(pid: pid, windowID: windowID)
+        else { return nil }
+
+        self.windowID = windowID
+        self.element = element
+        home = bounds.origin
+        size = bounds.size
+        // An app that hangs must not freeze us for AX's default 6 s.
+        AXUIElementSetMessagingTimeout(element, 1)
+
+        let frame = NSRect(x: bounds.minX, y: primaryDisplayHeight - bounds.maxY,
+                           width: bounds.width, height: bounds.height)
+        overlay = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        overlay.isOpaque = false
+        overlay.backgroundColor = .clear       // rounded corners stay rounded
+        overlay.hasShadow = false
+        overlay.ignoresMouseEvents = true      // the whole point: clicks go behind
+        overlay.isReleasedWhenClosed = false
+        overlay.animationBehavior = .none
+        overlay.sharingType = .none            // still hidden from the audience
+        overlay.level = .floating              // above whatever becomes active
+        overlay.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
+        overlay.alphaValue = alpha
+
+        let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        view.wantsLayer = true
+        content.frame = view.bounds
+        content.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        content.contentsGravity = .resize
+        content.actions = ["contents": NSNull(), "bounds": NSNull(),
+                           "position": NSNull(), "frame": NSNull()]
+        view.layer?.addSublayer(content)
+        overlay.contentView = view
+
+        super.init()
+        startCapture(scale: NSScreen.screens.first { $0.frame.intersects(frame) }?.backingScaleFactor ?? 2)
+    }
+
+    private static func axWindow(pid: pid_t, windowID: CGWindowID) -> AXUIElement? {
+        let app = AXUIElementCreateApplication(pid)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return nil }
+        return windows.first { w in
+            var id: CGWindowID = 0
+            return _AXUIElementGetWindow(w, &id) == .success && id == windowID
+        }
+    }
+
+    // MARK: capture
+
+    private func startCapture(scale: CGFloat) {
+        Task { @MainActor [weak self] in
+            let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard let self, !self.released else { return }
+            guard let scWindow = content?.windows.first(where: { $0.windowID == self.windowID }) else {
+                self.fail("window not capturable")
+                return
+            }
+            let cfg = SCStreamConfiguration()
+            cfg.width = Int((self.size.width * scale).rounded())
+            cfg.height = Int((self.size.height * scale).rounded())
+            cfg.scalesToFit = true
+            cfg.pixelFormat = kCVPixelFormatType_32BGRA   // keeps the corners' alpha
+            cfg.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+            cfg.queueDepth = 4
+            cfg.showsCursor = false
+            if #available(macOS 14.0, *) {
+                cfg.ignoreShadowsSingleWindow = true      // frame == window bounds
+                cfg.captureResolution = .best
+            }
+            let s = SCStream(filter: SCContentFilter(desktopIndependentWindow: scWindow),
+                             configuration: cfg, delegate: self)
+            do {
+                try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.sampleQueue)
+                self.stream = s
+                try await s.startCapture()
+            } catch {
+                self.fail(error.localizedDescription)
+                return
+            }
+            if self.released { try? await s.stopCapture() }
+        }
+    }
+
+    /// First frame: put the copy exactly over the real window, *then* move
+    /// the real one away — the swap is invisible.
+    private func show(_ surface: IOSurface) {
+        guard !released, stream != nil else { return }
+        content.contents = surface
+        guard !isParked else { return }
+        overlay.orderFrontRegardless()
+        guard move(to: Self.parkingOrigin(for: size)) else {
+            fail("could not move window")
+            return
+        }
+        isParked = true
+        onParked()
+    }
+
+    /// Bottom-right (else bottom-left) corner of a display where the parked
+    /// window overlaps no *other* display. macOS won't let a window leave the
+    /// screens entirely; the remaining one-point sliver also keeps the app
+    /// treating the window as visible, so it keeps rendering — and the copy
+    /// stays live.
+    private static func parkingOrigin(for size: CGSize) -> CGPoint {
+        let displays = DisplayHelper.active.map { CGDisplayBounds($0) }
+        let preferred = DisplayHelper.builtin.map { [CGDisplayBounds($0)] } ?? []
+        for d in preferred + displays {
+            for origin in [CGPoint(x: d.maxX - 1, y: d.maxY - 1),
+                           CGPoint(x: d.minX - size.width + 1, y: d.maxY - 1)] {
+                let rect = CGRect(origin: origin, size: size)
+                if !displays.contains(where: { $0 != d && $0.intersects(rect) }) { return origin }
+            }
+        }
+        let d = displays.first ?? .zero
+        return CGPoint(x: d.maxX - 1, y: d.maxY - 1)
+    }
+
+    private func move(to point: CGPoint) -> Bool {
+        var p = point
+        guard let value = AXValueCreate(.cgPoint, &p) else { return false }
+        return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, value) == .success
+    }
+
+    // MARK: teardown
+
+    /// Put the real window back and drop the copy.
+    func release() {
+        guard !released else { return }
+        released = true
+        if let s = stream {
+            stream = nil
+            s.stopCapture { _ in }
+        }
+        if isParked {
+            isParked = false
+            _ = move(to: home)
+        }
+        // A beat later, so the real window has redrawn under the copy.
+        let overlay = self.overlay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { overlay.orderOut(nil) }
+    }
+
+    private func fail(_ reason: String) {
+        NSLog("ScreenInScreen: could not pin window %u — %@", windowID, reason)
+        release()
+        onGone()
+    }
+
+    // MARK: SCStreamOutput / delegate
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen else { return }
+        relay.handle(sb)
+    }
+
+    /// Typically: the window was closed.
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.stream === stream else { return }
+            self.stream = nil
+            self.fail(error.localizedDescription)
+        }
+    }
+}
+
 // MARK: – Window picker -------------------------------------------------------
 
-/// Checkbox that reacts to the first click while its window is not key.
+/// Button (checkbox) that reacts to the first click while its window is not key.
 /// The picker is a non-activating panel, which never becomes key for a
 /// button click — a stock NSButton would swallow that click doing nothing.
-private final class FirstMouseCheckbox: NSButton {
+private final class FirstMouseButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var needsPanelToBecomeKey: Bool { false }
+}
+
+/// Same first-click story as `FirstMouseButton`, for the transparency slider.
+private final class FirstMouseSlider: NSSlider {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var needsPanelToBecomeKey: Bool { false }
 }
@@ -1154,7 +1919,7 @@ private final class FirstMouseCheckbox: NSButton {
 /// and mutated, never replaced, when the row set hasn't changed.
 private final class WindowCellView: NSTableCellView {
     static let reuseID = NSUserInterfaceItemIdentifier("WindowCellView")
-    let check = FirstMouseCheckbox()
+    let check = FirstMouseButton()
     private let appIcon = NSImageView()
     private let label = NSTextField(labelWithString: "")
 
@@ -1222,9 +1987,22 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
 
     var isHidden: (CGWindowID) -> Bool = { _ in false }
     var onToggle: (CGWindowID, Bool) -> Void = { _, _ in }
+    var transparency: () -> CGFloat = { 0 }
+    var onTransparencyChange: (CGFloat) -> Void = { _ in }
+    /// The stored pin-on-top shortcut, if any.
+    var pinShortcut: () -> KeyShortcut? = { nil }
+    /// New shortcut (nil: cleared). Returns false if it couldn't be bound.
+    var onPinShortcutChange: (KeyShortcut?) -> Bool = { _ in true }
+    /// The global hotkey must be off while recording, or pressing the current
+    /// combination would trigger it instead of being recorded.
+    var onRecordingShortcut: (Bool) -> Void = { _ in }
 
     private var entries: [Entry] = []
     private let table = NSTableView()
+    private let transparencySlider = FirstMouseSlider()
+    private let transparencyValue = NSTextField(labelWithString: "")
+    private let shortcutButton = FirstMouseButton()
+    private var recordingMonitor: Any?
     private var refreshTimer: Timer?
     private var panelBuilt = false
 
@@ -1243,10 +2021,46 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
         p.minSize = NSSize(width: 300, height: 240)
 
         let label = NSTextField(wrappingLabelWithString:
-            "Ticked windows are hidden from the audience. The list refreshes automatically.")
+            "Ticked windows are hidden from the audience and look see-through on your screen. The list refreshes automatically.")
         label.font = .systemFont(ofSize: 11)
         label.textColor = .secondaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
+
+        // How see-through hidden windows look on *your* screen. The audience
+        // is unaffected either way — for them the windows are simply gone.
+        let sliderTitle = NSTextField(labelWithString: "See-through on your screen:")
+        sliderTitle.font = .systemFont(ofSize: 11)
+        sliderTitle.setContentHuggingPriority(.required, for: .horizontal)
+        sliderTitle.setContentCompressionResistancePriority(.required, for: .horizontal)
+        transparencySlider.minValue = 0
+        transparencySlider.maxValue = Double(PresenterController.maxHiddenWindowTransparency)
+        transparencySlider.isContinuous = true
+        transparencySlider.controlSize = .small
+        transparencySlider.target = self
+        transparencySlider.action = #selector(transparencyChanged(_:))
+        transparencySlider.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        transparencyValue.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        transparencyValue.textColor = .secondaryLabelColor
+        transparencyValue.alignment = .right
+        let sliderRow = NSStackView(views: [sliderTitle, transparencySlider, transparencyValue])
+        sliderRow.orientation = .horizontal
+        sliderRow.spacing = 8
+        sliderRow.translatesAutoresizingMaskIntoConstraints = false
+
+        // Shortcut that pins the hidden windows on top, click-through.
+        let shortcutTitle = NSTextField(labelWithString: "Pin on top, click-through:")
+        shortcutTitle.font = .systemFont(ofSize: 11)
+        shortcutTitle.setContentHuggingPriority(.required, for: .horizontal)
+        shortcutButton.bezelStyle = .rounded
+        shortcutButton.controlSize = .small
+        shortcutButton.font = .systemFont(ofSize: 11)
+        shortcutButton.target = self
+        shortcutButton.action = #selector(shortcutButtonClicked)
+        shortcutButton.toolTip = "Click, then press the shortcut. ⌫ removes it, Esc cancels."
+        let shortcutRow = NSStackView(views: [shortcutTitle, shortcutButton, NSView()])
+        shortcutRow.orientation = .horizontal
+        shortcutRow.spacing = 8
+        shortcutRow.translatesAutoresizingMaskIntoConstraints = false
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("window"))
         // The single column must always span the table, whatever the panel
@@ -1270,12 +2084,22 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
 
         let content = NSView()
         content.addSubview(label)
+        content.addSubview(sliderRow)
+        content.addSubview(shortcutRow)
         content.addSubview(scroll)
         NSLayoutConstraint.activate([
             label.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
             label.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
             label.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
-            scroll.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 8),
+            sliderRow.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 8),
+            sliderRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            sliderRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            transparencyValue.widthAnchor.constraint(equalToConstant: 34),
+            shortcutRow.topAnchor.constraint(equalTo: sliderRow.bottomAnchor, constant: 6),
+            shortcutRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            shortcutRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            shortcutButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
+            scroll.topAnchor.constraint(equalTo: shortcutRow.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -1289,6 +2113,9 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
 
     func show() {
         panel.orderFront(nil)
+        transparencySlider.doubleValue = Double(transparency())
+        updateTransparencyLabel()
+        updateShortcutButton()
         refresh()
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
@@ -1301,6 +2128,59 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
     func windowWillClose(_ n: Notification) {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        stopRecording()
+    }
+
+    func windowDidResignKey(_ n: Notification) { stopRecording() }
+
+    // MARK: shortcut recording
+
+    private var isRecording: Bool { recordingMonitor != nil }
+
+    @objc private func shortcutButtonClicked() {
+        if isRecording { stopRecording() } else { startRecording() }
+    }
+
+    private func startRecording() {
+        onRecordingShortcut(true)
+        // A non-activating panel can still take keyboard focus — without
+        // pulling the presented app out of the foreground.
+        panel.makeKey()
+        recordingMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.record(event)
+            return nil   // swallow: nothing else should react while recording
+        }
+        updateShortcutButton()
+    }
+
+    private func record(_ event: NSEvent) {
+        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        switch Int(event.keyCode) {
+        case kVK_Escape:
+            stopRecording()
+        case kVK_Delete where flags.isEmpty, kVK_ForwardDelete where flags.isEmpty:
+            _ = onPinShortcutChange(nil)
+            stopRecording()
+        default:
+            // Plain keys would hijack normal typing system-wide.
+            guard let shortcut = KeyShortcut(event: event), onPinShortcutChange(shortcut) else {
+                NSSound.beep()
+                return   // keep listening for a usable combination
+            }
+            stopRecording()
+        }
+    }
+
+    private func stopRecording() {
+        guard let monitor = recordingMonitor else { return }
+        NSEvent.removeMonitor(monitor)
+        recordingMonitor = nil
+        onRecordingShortcut(false)
+        updateShortcutButton()
+    }
+
+    private func updateShortcutButton() {
+        shortcutButton.title = isRecording ? "Type shortcut…" : (pinShortcut()?.display ?? "Set Shortcut")
     }
 
     // MARK: list
@@ -1375,5 +2255,17 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
 
     @objc private func checkboxToggled(_ sender: NSButton) {
         onToggle(CGWindowID(sender.tag), sender.state == .on)
+    }
+
+    @objc private func transparencyChanged(_ sender: NSSlider) {
+        // Snap to whole percent so the label and the stored value agree.
+        let value = (sender.doubleValue * 100).rounded() / 100
+        onTransparencyChange(CGFloat(value))
+        updateTransparencyLabel()
+    }
+
+    private func updateTransparencyLabel() {
+        let percent = Int((transparencySlider.doubleValue * 100).rounded())
+        transparencyValue.stringValue = percent == 0 ? "Off" : "\(percent)%"
     }
 }
