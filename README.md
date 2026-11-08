@@ -93,9 +93,3 @@ only fires while the preview window is frontmost — the menu bar icon always wo
   **Click Through to Monitor** is ticked in the right-click menu.  
 * **Gatekeeper blocked?**  
   Right-click → Open once; macOS remembers the choice.
-
------------------------------------------------------------------------
-
-## License
-**[CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/deed.en)**  
-© 2026 the ScreenInScreen developers
