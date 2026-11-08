@@ -1,5 +1,3 @@
-http://screeninscreen.app
-
 # ScreenInScreen
 
 A tiny macOS utility that mirrors an external monitor in a resizable window.
@@ -7,11 +5,15 @@ A tiny macOS utility that mirrors an external monitor in a resizable window.
 -----------------------------------------------------------------------
 
 ## Quick-Start
-1. **Download** `ScreenInScreen.zip` and extract.  
-2. Drag **ScreenInScreen.app** to **Applications** (optional).  
-3. First launch: **Right-click** → **Open** → **Open** (bypass Gatekeeper).  
-4. Click **OK** when macOS asks for *Screen & System Audio Recording* access. (or go to seetings->privacy&security->screen&system audio recording and turn on for screeninscreen) 
-5. The display icon appears in the menu bar—ready to use!
+1. **Download** the latest `ScreenInScreen-<version>.dmg` from the
+   [Releases](../../releases/latest) page, open it, and drag **ScreenInScreen**
+   to **Applications**.  
+2. First launch: **Right-click** → **Open** → **Open** (the app is ad-hoc
+   signed, not notarized, so Gatekeeper asks once).  
+3. Click **OK** when macOS asks for *Screen & System Audio Recording* access
+   (or enable ScreenInScreen under System Settings ▸ Privacy & Security ▸
+   Screen & System Audio Recording).  
+4. The display icon appears in the menu bar—ready to use!
 
 -----------------------------------------------------------------------
 
@@ -48,7 +50,8 @@ on the external display, and a floating **Hidden Windows** checklist opens:
 tick a window and it vanishes from the audience's view instantly (it stays
 visible to you). New windows appear in the mirror automatically; the checklist
 refreshes itself. ScreenInScreen's own windows are never shown to the
-audience.
+audience. Turn the mode off via the same menu item, or it ends automatically
+when the monitor is unplugged.
 
 Ticked windows turn slightly **see-through on your own screen** — right away,
 even before presenter mode is on — so you can tell at a glance what the
@@ -64,8 +67,7 @@ scrolls go straight through to whatever is behind it — even when that window
 becomes active. Press the shortcut again (or use **Pin Windows**
 in the menu) to unpin. Under the hood the real window is moved into a screen
 corner while a live copy is shown in its place; it is moved back when you
-unpin or quit. Needs **Accessibility** access. Turn the mode off via the same menu item, or it ends automatically
-when the monitor is unplugged.
+unpin or quit. Needs **Accessibility** access.
 
 *The ⌥B shortcut works app-wide once macOS grants **Accessibility** access
 (System Settings ▸ Privacy & Security ▸ Accessibility). Without it, the shortcut
@@ -93,3 +95,15 @@ only fires while the preview window is frontmost — the menu bar icon always wo
   **Click Through to Monitor** is ticked in the right-click menu.  
 * **Gatekeeper blocked?**  
   Right-click → Open once; macOS remembers the choice.
+
+-----------------------------------------------------------------------
+
+## Building from source
+Requires Xcode 15 or newer.
+
+```sh
+packaging/package.sh 0.2.0   # builds, ad-hoc signs, and creates a DMG
+```
+
+The app and DMG land in `build/dd/Build/Products/Release/`. To just build,
+open `ScreenInScreen.xcodeproj` in Xcode and run the **ScreenInScreen** scheme.

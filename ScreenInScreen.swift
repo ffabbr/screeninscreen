@@ -809,7 +809,7 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
         previewView.layer?.addSublayer(contentLayer)
         window.contentView = previewView
 
-        // ► immer im Vordergrund + in allen Spaces
+        // Always on top, and on every Space
         window.level = .floating
         window.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
 
