@@ -27,6 +27,7 @@ A tiny macOS utility that mirrors an external monitor in a resizable window.
 | Presenter mode          | **Right-click** menu bar icon → **Presenter Mode (Mac → Monitor)** |
 | Hide windows from audience | **Right-click** menu bar icon → **Settings…** |
 | Pin hidden windows on top (click-through) | Your recorded shortcut, **or** right-click → **Pin Windows** |
+| Bring a hidden window to the front | Your recorded shortcut, **or** right-click → **Bring Hidden Window to Front** |
 | Quit ScreenInScreen     | **Right-click** menu bar icon → **Quit ScreenInScreen**    |
 
 *Window size & position are remembered across launches.*
@@ -53,6 +54,12 @@ refreshes itself. ScreenInScreen's own windows are never shown to the
 audience. Turn the mode off via the same menu item, or it ends automatically
 when the monitor is unplugged.
 
+**Recording the talk.** To record (or screen-share) exactly what the audience
+sees, record the **external display** — e.g. QuickTime ▸ New Screen Recording
+▸ pick the external screen. The recording shows the mirror with hidden windows
+already removed. Recording the Mac's own screen captures everything,
+including the hidden windows.
+
 Ticked windows turn slightly **see-through on your own screen** — right away,
 even before presenter mode is on — so you can tell at a glance what the
 audience can't see. Set how see-through with the
@@ -69,9 +76,15 @@ in the menu) to unpin. Under the hood the real window is moved into a screen
 corner while a live copy is shown in its place; it is moved back when you
 unpin or quit. Needs **Accessibility** access.
 
-*The ⌥B shortcut works app-wide once macOS grants **Accessibility** access
-(System Settings ▸ Privacy & Security ▸ Accessibility). Without it, the shortcut
-only fires while the preview window is frontmost — the menu bar icon always works.*
+**Bring to front.** Record a second shortcut under **Bring to front** in the
+same panel. Pressing it makes a ticked window the active one — only that
+window, not the app's other windows — so you can jump to your notes without
+Mission Control. With several windows ticked, each press moves on to the next
+one. Pinned windows are skipped; the window must be on the current Space.
+Needs **Accessibility** access.
+
+*The ⌥B shortcut is a system-wide hotkey: it works from any app and needs no
+extra permission.*
 
 -----------------------------------------------------------------------
 

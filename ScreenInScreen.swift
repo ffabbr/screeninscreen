@@ -189,6 +189,12 @@ final class SurfaceRelay {
             if let next { self.deliver(next) }
         }
     }
+
+    func clear() {
+        lock.lock()
+        pending = nil
+        lock.unlock()
+    }
 }
 
 // MARK: – Accessibility helper ----------------------------------------------
@@ -262,6 +268,11 @@ struct KeyShortcut: Equatable {
         self.keyCode = keyCode
         self.carbonModifiers = carbonModifiers
         self.display = display
+    }
+
+    /// Same physical combination (the display string is irrelevant).
+    func sameKeys(as other: KeyShortcut) -> Bool {
+        keyCode == other.keyCode && carbonModifiers == other.carbonModifiers
     }
 
     static func load(_ key: String) -> KeyShortcut? {
@@ -538,20 +549,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         picker.onTransparencyChange = { [weak self] value in
             self?.presenter.hiddenWindowTransparency = value
         }
-        picker.pinShortcut = { KeyShortcut.load(Self.pinShortcutDefaultsKey) }
-        picker.onPinShortcutChange = { [weak self] shortcut in
+        picker.shortcut = { slot in KeyShortcut.load(Self.defaultsKey(for: slot)) }
+        picker.onShortcutChange = { [weak self] slot, shortcut in
             guard let self else { return false }
-            if let shortcut, !self.pinHotKey.register(shortcut) { return false }
-            if shortcut == nil { self.pinHotKey.unregister() }
-            KeyShortcut.save(shortcut, Self.pinShortcutDefaultsKey)
+            if let shortcut {
+                // One combination, one job: ⌥B toggles the preview, and the
+                // other slot may already use this one.
+                if shortcut.sameKeys(as: Self.toggleShortcut) { return false }
+                for other in WindowPickerController.ShortcutSlot.allCases where other != slot {
+                    if let taken = KeyShortcut.load(Self.defaultsKey(for: other)),
+                       taken.sameKeys(as: shortcut) { return false }
+                }
+                if !self.hotKey(for: slot).register(shortcut) { return false }
+            } else {
+                self.hotKey(for: slot).unregister()
+            }
+            KeyShortcut.save(shortcut, Self.defaultsKey(for: slot))
             return true
         }
         picker.onRecordingShortcut = { [weak self] recording in
             guard let self else { return }
-            if recording {
-                self.pinHotKey.unregister()
-            } else if let stored = KeyShortcut.load(Self.pinShortcutDefaultsKey) {
-                self.pinHotKey.register(stored)
+            for slot in WindowPickerController.ShortcutSlot.allCases {
+                if recording {
+                    self.hotKey(for: slot).unregister()
+                } else if let stored = KeyShortcut.load(Self.defaultsKey(for: slot)) {
+                    self.hotKey(for: slot).register(stored)
+                }
             }
         }
         return picker
@@ -560,7 +583,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var localMonitor: Any?
     private var trustPollTimer: Timer?
     private static let pinShortcutDefaultsKey = "PinHiddenWindowsShortcut"
+    private static let focusShortcutDefaultsKey = "FocusHiddenWindowShortcut"
     private lazy var pinHotKey = GlobalHotKey { [weak self] in self?.togglePinned() }
+    private lazy var focusHotKey = GlobalHotKey { [weak self] in self?.focusHiddenWindow() }
+
+    private static func defaultsKey(for slot: WindowPickerController.ShortcutSlot) -> String {
+        switch slot {
+        case .pin: return pinShortcutDefaultsKey
+        case .focus: return focusShortcutDefaultsKey
+        }
+    }
+    private func hotKey(for slot: WindowPickerController.ShortcutSlot) -> GlobalHotKey {
+        switch slot {
+        case .pin: return pinHotKey
+        case .focus: return focusHotKey
+        }
+    }
+    private static let toggleShortcut = KeyShortcut(keyCode: UInt32(kVK_ANSI_B),
+                                                    carbonModifiers: UInt32(optionKey), display: "⌥B")
+    private lazy var toggleHotKey = GlobalHotKey { [weak self] in self?.mirror.toggleWindow() }
 
     func applicationDidFinishLaunching(_ n: Notification) {
 
@@ -577,7 +618,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         mirror.showWindow()
         registerHotkey()
-        if let shortcut = KeyShortcut.load(Self.pinShortcutDefaultsKey) { pinHotKey.register(shortcut) }
+        for slot in WindowPickerController.ShortcutSlot.allCases {
+            if let shortcut = KeyShortcut.load(Self.defaultsKey(for: slot)) { hotKey(for: slot).register(shortcut) }
+        }
         ensureAccessibility()
     }
 
@@ -593,7 +636,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mirror.shutDown()
     }
 
-    // MARK: Accessibility (click-through + global ⌥B both need it) ----------
+    // MARK: Accessibility (click-through and pinning need it) ----------------
     private func ensureAccessibility() {
         trustPollTimer?.invalidate()
         trustPollTimer = nil
@@ -645,6 +688,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pinItem = NSMenuItem(title: pinTitle, action: #selector(togglePinned), keyEquivalent: "")
         pinItem.state = presenter.isPinned ? .on : .off
         menu.addItem(pinItem)
+        var focusTitle = "Bring Hidden Window to Front"
+        if let shortcut = KeyShortcut.load(Self.focusShortcutDefaultsKey) { focusTitle += "  (\(shortcut.display))" }
+        menu.addItem(NSMenuItem(title: focusTitle, action: #selector(focusHiddenWindow), keyEquivalent: ""))
 
         menu.addItem(.separator())
 
@@ -704,6 +750,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         presenter.setPinned(true)
     }
+
+    /// Make a hidden (ticked) window the active one — just that window, not
+    /// its app's other windows. With several ticked, each press moves on to
+    /// the next one.
+    @objc private func focusHiddenWindow() {
+        guard Accessibility.trusted else {
+            NSSound.beep()
+            ensureAccessibility()
+            return
+        }
+        // Pinned windows are parked off-screen behind a click-through copy —
+        // activating one would send typing to a window that can't be seen.
+        var ids = presenter.hiddenWindowIDs.subtracting(presenter.parkedWindowIDs).sorted()
+        if let current = WindowFocus.focusedWindowID(), let idx = ids.firstIndex(of: current) {
+            ids = Array(ids[(idx + 1)...] + ids[..<idx])   // already there: next one
+        }
+        // Ticked windows that were closed since simply fail and are skipped.
+        if !ids.contains(where: { WindowFocus.focus($0) }) { NSSound.beep() }
+    }
+
     @objc private func quit() { NSApp.terminate(nil) }
 
     @objc private func toggleClickThrough() {
@@ -719,6 +785,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: hotkey ⌥B
     private func registerHotkey() {
+        // A real system-wide hotkey: works without Accessibility access and
+        // consumes the keystroke, so the frontmost app never gets a stray "∫".
+        if toggleHotKey.register(Self.toggleShortcut) { return }
+        // Combination taken by another app — fall back to event monitors.
         // The global monitor only fires once the user grants Accessibility access;
         // the local monitor keeps the shortcut working while we are frontmost.
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] e in _ = self?.handle(e) }
@@ -761,7 +831,20 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
     // Capture
     private var stream: SCStream?
     private let sampleQueue = DispatchQueue(label: "app.screeninscreen.capture", qos: .userInitiated)
-    private lazy var relay = FrameRelay(layer: contentLayer)
+    /// Frames are captured at exactly the content layer's pixel size, so the
+    /// stream's IOSurface goes straight into the layer — no copy, no readback.
+    private lazy var relay = SurfaceRelay { [weak self] surface in
+        guard let self, self.wantsStream else { return }
+        self.contentLayer.contents = surface
+    }
+    /// Whether a capture should be running (the preview is shown). Set
+    /// synchronously on the main thread; `syncStream` makes it so.
+    private var wantsStream = false
+    /// Bumped by every `syncStream`/shutdown — an older, still-suspended call
+    /// sees the mismatch and backs out instead of clobbering newer state.
+    private var streamGeneration = 0
+    /// Automatic restarts since the last user-initiated start (capped).
+    private var restartAttempts = 0
 
     // Remember frame in session
     private var lastFrame: NSRect?
@@ -849,8 +932,21 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
     deinit { NotificationCenter.default.removeObserver(self) }
 
     // MARK: stream
-    private func startStream(for id: CGDirectDisplayID) async {
-        await stopStream()
+
+    /// Bring the capture in line with what is wanted *right now*: stop any
+    /// running stream, then — if the preview is shown — start one for the
+    /// current display. Reads live state, so calls may overlap or arrive in
+    /// any order; the newest one wins. Main actor: touches AppKit geometry.
+    @MainActor private func syncStream() async {
+        streamGeneration += 1
+        let generation = streamGeneration
+
+        if let old = stream {
+            stream = nil
+            try? await old.stopCapture()
+            relay.clear()
+        }
+        guard generation == streamGeneration, wantsStream else { return }
 
         let content: SCShareableContent
         do {
@@ -858,27 +954,34 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
         } catch {
             // Almost always missing Screen Recording permission — tell the user
             // instead of leaving them with a black window.
-            showPermissionAlert(error)
+            if generation == streamGeneration { showPermissionAlert(error) }
             return
         }
-        guard let disp = content.displays.first(where: { $0.displayID == id }) else { return }
+        guard generation == streamGeneration, wantsStream,
+              let disp = content.displays.first(where: { $0.displayID == currentDisplayID }) else { return }
 
         let filter = SCContentFilter(display: disp, excludingWindows: [])
-        let s = SCStream(filter: filter, configuration: makeConfiguration(), delegate: self)
+        let cfg = makeConfiguration()
+        let s = SCStream(filter: filter, configuration: cfg, delegate: self)
         do {
             try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
             try await s.startCapture()
-            stream = s
         } catch {
             NSLog("ScreenInScreen: stream error — %@", error.localizedDescription)
+            return
         }
+        guard generation == streamGeneration, wantsStream else {
+            try? await s.stopCapture()   // hidden or superseded while starting up
+            return
+        }
+        stream = s
+        // The window may have been resized while the stream was starting.
+        let size = captureSize()
+        if size.width != cfg.width || size.height != cfg.height { reconfigureForCurrentSize() }
     }
 
-    private func stopStream() async {
-        guard let s = stream else { return }
-        stream = nil
-        try? await s.stopCapture()
-        relay.clear()
+    private func scheduleSync() {
+        Task { @MainActor [weak self] in await self?.syncStream() }
     }
 
     // MARK: geometry — single source of truth for capture, layout & clicks
@@ -921,7 +1024,9 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
         cfg.pixelFormat = kCVPixelFormatType_32BGRA
         cfg.colorSpaceName = CGColorSpace.sRGB
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        cfg.queueDepth = 3
+        // The layer holds on to the surface it is showing, so leave the
+        // capture pool a few spare ones to keep rendering into.
+        cfg.queueDepth = 5
         cfg.showsCursor = true
         return cfg
     }
@@ -958,8 +1063,7 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
             if #available(macOS 14.0, *) {
                 try? await s.updateConfiguration(cfg)
             } else {
-                guard let self else { return }
-                await self.startStream(for: self.currentDisplayID)
+                await self?.syncStream()
             }
         }
     }
@@ -969,21 +1073,25 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
         currentDisplayID = id
         enforceAspectRatio()   // aspect ratio may differ
         layoutContentLayer()
-        guard window.isVisible else { return }
-        Task { await startStream(for: id) }
+        guard wantsStream else { return }
+        restartAttempts = 0
+        scheduleSync()
     }
 
     /// The mirrored monitor may have been unplugged — fall back to a live one.
     @objc private func screensChanged() {
-        defer {                          // resolution/aspect may have changed
-            enforceAspectRatio()
-            layoutContentLayer()
+        var needsRestart = false
+        if !DisplayHelper.active.contains(currentDisplayID),
+           let fallback = DisplayHelper.selectable.first {
+            currentDisplayID = fallback
+            needsRestart = true
         }
-        guard !DisplayHelper.active.contains(currentDisplayID),
-              let fallback = DisplayHelper.selectable.first else { return }
-        currentDisplayID = fallback
-        guard window.isVisible else { return }
-        Task { await startStream(for: fallback) }
+        enforceAspectRatio()             // resolution/aspect may have changed
+        layoutContentLayer()
+        // Also revive a capture that died earlier (display slept, …).
+        guard wantsStream, needsRestart || stream == nil else { return }
+        restartAttempts = 0
+        scheduleSync()
     }
 
     // MARK: click-through mapping
@@ -1034,11 +1142,14 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
 
     // MARK: window helpers
     func showWindow() {
+        let wasShown = wantsStream
         if let f = lastFrame { window.setFrame(f, display: true) }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refreshForwarding()
-        if stream == nil { Task { await startStream(for: currentDisplayID) } }
+        wantsStream = true
+        restartAttempts = 0
+        if !wasShown || stream == nil { scheduleSync() }
     }
 
     func toggleWindow() {
@@ -1051,10 +1162,13 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
         lastFrame = window.frame
         window.orderOut(nil)
         refreshForwarding()
-        Task { await stopStream() }
+        wantsStream = false
+        scheduleSync()
     }
 
     func shutDown() {
+        wantsStream = false
+        streamGeneration += 1            // any start still in flight backs out
         guard let s = stream else { return }
         stream = nil
         s.stopCapture { _ in }
@@ -1064,7 +1178,8 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
         lastFrame = window.frame
         // The window still counts as visible here — re-check once it's gone.
         DispatchQueue.main.async { [weak self] in self?.refreshForwarding() }
-        Task { await stopStream() }
+        wantsStream = false
+        scheduleSync()
     }
 
     func windowDidEndLiveResize(_ n: Notification) { reconfigureForCurrentSize() }
@@ -1090,17 +1205,29 @@ final class MirrorController: NSObject, SCStreamOutput, SCStreamDelegate, NSWind
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         NSLog("ScreenInScreen: stream stopped — %@", error.localizedDescription)
+        // "Stop sharing" in the system UI is the user's decision — respect it.
+        let userStopped = (error as? SCStreamError)?.code == .userStopped
         DispatchQueue.main.async { [weak self] in
             guard let self, self.stream === stream else { return }
             self.stream = nil
+            guard self.wantsStream, !userStopped, self.restartAttempts < 3 else {
+                // Giving up: a black preview is honest, a frozen one is not.
+                self.contentLayer.contents = nil
+                return
+            }
+            self.restartAttempts += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self, self.wantsStream, self.stream == nil else { return }
+                self.scheduleSync()
+            }
         }
     }
 
     // MARK: permission
     private func showPermissionAlert(_ error: Error) {
         NSLog("ScreenInScreen: shareable content unavailable — %@", error.localizedDescription)
-        // startStream runs on a background executor; AppKit alerts must be
-        // built and run on the main thread.
+        // Deferred to the next main-loop turn: a modal alert must not run in
+        // the middle of the stream start-up that reported the error.
         DispatchQueue.main.async { [weak self] in self?.runPermissionAlert() }
     }
 
@@ -1166,6 +1293,14 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
     private lazy var relay = FrameRelay(layer: contentLayer)
     private var stream: SCStream?
     private let sampleQueue = DispatchQueue(label: "app.screeninscreen.presenter", qos: .userInitiated)
+    /// Bumped by every start/stop — an older, still-suspended start sees the
+    /// mismatch and backs out instead of clobbering newer state.
+    private var streamGeneration = 0
+    /// Bumped whenever the hidden set changes, so a stream that was starting
+    /// up meanwhile knows its filter is already stale.
+    private var filterVersion = 0
+    /// Automatic restarts since Presenter Mode was switched on (capped).
+    private var restartAttempts = 0
 
     override init() {
         UserDefaults.standard.register(defaults: [Self.transparencyDefaultsKey: 0.3])
@@ -1202,9 +1337,10 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         isActive = true
+        restartAttempts = 0
         outputDisplayID = displayID
         makeOutputWindow(on: screen)
-        Task { await startStream() }
+        scheduleStart()
     }
 
     func stop() {
@@ -1213,7 +1349,8 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
         outputDisplayID = nil
         outputWindow?.orderOut(nil)
         outputWindow = nil
-        Task { await stopStream() }
+        contentLayer.contents = nil   // no stale frame flashing on the next start
+        Task { @MainActor [weak self] in await self?.stopStream() }
     }
 
     /// User picked a different display in the menu while presenting.
@@ -1235,6 +1372,9 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
         refreshCaptureFilters()
     }
 
+    /// Hidden windows currently parked behind a pinned copy.
+    var parkedWindowIDs: Set<CGWindowID> { pinner.parkedIDs }
+
     /// Pin the hidden windows on top, click-through — or put them back.
     func setPinned(_ pinned: Bool) {
         isPinned = pinned
@@ -1244,9 +1384,12 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Rebuild the veil's and the audience stream's filters from the current
     /// window set (our own windows, incl. fresh overlays, are excluded).
     private func refreshCaptureFilters() {
+        filterVersion += 1
         refreshVeil()
+        // No stream yet: one may be starting up — it re-checks `filterVersion`
+        // once it is live and comes back here if its filter is stale.
         guard isActive, let s = stream else { return }
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self, let filter = await self.makeFilter() else { return }
             do { try await s.updateContentFilter(filter) }
             catch { await self.startStream() }   // stream died — rebuild it
@@ -1269,13 +1412,11 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
         veilGeneration += 1
         guard !targets.isEmpty else { return }
         let generation = veilGeneration
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self, let filter = await self.makeFilter() else { return }
-            await MainActor.run {
-                // A newer refresh overtook this one — its filter is stale.
-                guard generation == self.veilGeneration else { return }
-                self.veil.apply(filter)
-            }
+            // A newer refresh overtook this one — its filter is stale.
+            guard generation == self.veilGeneration else { return }
+            self.veil.apply(filter)
         }
     }
 
@@ -1292,7 +1433,12 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
         // covers the whole screen including that menu bar.
         w.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        w.sharingType = .none         // uncapturable — no hall-of-mirrors, ever
+        // Capturable on purpose: recording or screen-sharing the external
+        // display (QuickTime, Zoom, …) must show exactly what the audience
+        // sees — hidden windows already removed. No hall-of-mirrors: this
+        // window lives on the output display, while our stream captures the
+        // built-in one and excludes all of our own windows (see makeFilter).
+        w.sharingType = .readOnly
 
         let view = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
         view.wantsLayer = true
@@ -1329,7 +1475,9 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     // MARK: stream
-    private func makeFilter() async -> SCContentFilter? {
+
+    /// Main actor: reads `hiddenWindowIDs`, which only the main thread mutates.
+    @MainActor private func makeFilter() async -> SCContentFilter? {
         guard let source = DisplayHelper.builtin,
               let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false),
               let disp = content.displays.first(where: { $0.displayID == source })
@@ -1367,20 +1515,43 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
         return (Int(native.width) & ~1, Int(native.height) & ~1)
     }
 
-    private func startStream() async {
-        await stopStream()
-        guard isActive, let filter = await makeFilter() else { return }
+    @MainActor private func startStream() async {
+        streamGeneration += 1
+        let generation = streamGeneration
+        await tearDownStream()
+        guard generation == streamGeneration, isActive else { return }
+
+        let version = filterVersion
+        guard let filter = await makeFilter(),
+              generation == streamGeneration, isActive else { return }
         let s = SCStream(filter: filter, configuration: makeConfiguration(), delegate: self)
         do {
             try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
             try await s.startCapture()
-            stream = s
         } catch {
             NSLog("ScreenInScreen: presenter stream error — %@", error.localizedDescription)
+            return
         }
+        guard generation == streamGeneration, isActive else {
+            try? await s.stopCapture()   // stopped or superseded while starting up
+            return
+        }
+        stream = s
+        // A window was ticked while the stream was starting: its filter
+        // predates that — bring it up to date before the audience notices.
+        if version != filterVersion { refreshCaptureFilters() }
     }
 
-    private func stopStream() async {
+    private func scheduleStart() {
+        Task { @MainActor [weak self] in await self?.startStream() }
+    }
+
+    @MainActor private func stopStream() async {
+        streamGeneration += 1
+        await tearDownStream()
+    }
+
+    @MainActor private func tearDownStream() async {
         guard let s = stream else { return }
         stream = nil
         try? await s.stopCapture()
@@ -1388,7 +1559,13 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func reconfigure() {
-        guard let s = stream else { return }
+        guard let s = stream else {
+            // The capture died earlier — a display change is a good moment
+            // to bring it back.
+            restartAttempts = 0
+            scheduleStart()
+            return
+        }
         let cfg = makeConfiguration()
         Task { [weak self] in
             if #available(macOS 14.0, *) {
@@ -1426,9 +1603,18 @@ final class PresenterController: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         NSLog("ScreenInScreen: presenter stream stopped — %@", error.localizedDescription)
+        // "Stop sharing" in the system UI is the user's decision — respect it.
+        let userStopped = (error as? SCStreamError)?.code == .userStopped
         DispatchQueue.main.async { [weak self] in
             guard let self, self.stream === stream else { return }
             self.stream = nil
+            // Don't leave the audience on a frozen frame: try to come back.
+            guard self.isActive, !userStopped, self.restartAttempts < 3 else { return }
+            self.restartAttempts += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self, self.isActive, self.stream == nil else { return }
+                self.scheduleStart()
+            }
         }
     }
 
@@ -1665,6 +1851,62 @@ final class HiddenWindowVeil: NSObject, SCStreamOutput, SCStreamDelegate {
 @_silgen_name("_AXUIElementGetWindow")
 private func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
 
+/// Accessibility-side operations on a single window of another app.
+enum WindowFocus {
+    /// The Accessibility element for a CGWindowID. Only finds windows on the
+    /// current Space — Accessibility doesn't list the others.
+    static func element(pid: pid_t, windowID: CGWindowID) -> AXUIElement? {
+        let app = AXUIElementCreateApplication(pid)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return nil }
+        return windows.first { w in
+            var id: CGWindowID = 0
+            return _AXUIElementGetWindow(w, &id) == .success && id == windowID
+        }
+    }
+
+    /// The window that currently has keyboard focus, system-wide.
+    static func focusedWindowID() -> CGWindowID? {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 1)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success,
+              let ref = value, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        var id: CGWindowID = 0
+        guard _AXUIElementGetWindow(ref as! AXUIElement, &id) == .success, id != 0 else { return nil }
+        return id
+    }
+
+    /// Bring one window to the front and make it the active one, leaving the
+    /// app's other windows where they are. False if the window is gone (or
+    /// can't be reached through Accessibility).
+    static func focus(_ windowID: CGWindowID) -> Bool {
+        guard let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]])?.first,
+              let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+              let window = element(pid: pid, windowID: windowID) else { return false }
+        // An app that hangs must not freeze us for AX's default 6 s.
+        AXUIElementSetMessagingTimeout(window, 1)
+
+        var minimized: CFTypeRef?
+        if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimized) == .success,
+           (minimized as? Bool) == true {
+            AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        }
+        // Make it the app's main window and raise it *before* activating:
+        // activation without `.activateAllWindows` brings only the main/key
+        // window forward — exactly the one we just chose.
+        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        if NSRunningApplication(processIdentifier: pid)?.activate(options: []) != true {
+            AXUIElementSetAttributeValue(AXUIElementCreateApplication(pid),
+                                         kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        }
+        return true
+    }
+}
+
 /// Pins windows "on top, click-through": the window stays visible where it
 /// was, floats above everything, and every click lands on whatever is behind
 /// it — as if it weren't there.
@@ -1731,7 +1973,7 @@ private final class Pin: NSObject, SCStreamOutput, SCStreamDelegate {
               let pid = info[kCGWindowOwnerPID as String] as? pid_t,
               let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
               let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
-              let element = Self.axWindow(pid: pid, windowID: windowID)
+              let element = WindowFocus.element(pid: pid, windowID: windowID)
         else { return nil }
 
         self.windowID = windowID
@@ -1767,17 +2009,6 @@ private final class Pin: NSObject, SCStreamOutput, SCStreamDelegate {
 
         super.init()
         startCapture(scale: NSScreen.screens.first { $0.frame.intersects(frame) }?.backingScaleFactor ?? 2)
-    }
-
-    private static func axWindow(pid: pid_t, windowID: CGWindowID) -> AXUIElement? {
-        let app = AXUIElementCreateApplication(pid)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement] else { return nil }
-        return windows.first { w in
-            var id: CGWindowID = 0
-            return _AXUIElementGetWindow(w, &id) == .success && id == windowID
-        }
     }
 
     // MARK: capture
@@ -1989,10 +2220,15 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
     var onToggle: (CGWindowID, Bool) -> Void = { _, _ in }
     var transparency: () -> CGFloat = { 0 }
     var onTransparencyChange: (CGFloat) -> Void = { _ in }
-    /// The stored pin-on-top shortcut, if any.
-    var pinShortcut: () -> KeyShortcut? = { nil }
+    /// The user-recordable shortcuts shown in the panel.
+    enum ShortcutSlot: Int, CaseIterable {
+        case pin     // pin the hidden windows on top, click-through
+        case focus   // bring a hidden window to the front
+    }
+    /// The stored shortcut for a slot, if any.
+    var shortcut: (ShortcutSlot) -> KeyShortcut? = { _ in nil }
     /// New shortcut (nil: cleared). Returns false if it couldn't be bound.
-    var onPinShortcutChange: (KeyShortcut?) -> Bool = { _ in true }
+    var onShortcutChange: (ShortcutSlot, KeyShortcut?) -> Bool = { _, _ in true }
     /// The global hotkey must be off while recording, or pressing the current
     /// combination would trigger it instead of being recorded.
     var onRecordingShortcut: (Bool) -> Void = { _ in }
@@ -2001,7 +2237,9 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
     private let table = NSTableView()
     private let transparencySlider = FirstMouseSlider()
     private let transparencyValue = NSTextField(labelWithString: "")
-    private let shortcutButton = FirstMouseButton()
+    private let shortcutButtons: [ShortcutSlot: FirstMouseButton] =
+        [.pin: FirstMouseButton(), .focus: FirstMouseButton()]
+    private var recordingSlot: ShortcutSlot?
     private var recordingMonitor: Any?
     private var refreshTimer: Timer?
     private var panelBuilt = false
@@ -2048,19 +2286,9 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
         sliderRow.translatesAutoresizingMaskIntoConstraints = false
 
         // Shortcut that pins the hidden windows on top, click-through.
-        let shortcutTitle = NSTextField(labelWithString: "Pin on top, click-through:")
-        shortcutTitle.font = .systemFont(ofSize: 11)
-        shortcutTitle.setContentHuggingPriority(.required, for: .horizontal)
-        shortcutButton.bezelStyle = .rounded
-        shortcutButton.controlSize = .small
-        shortcutButton.font = .systemFont(ofSize: 11)
-        shortcutButton.target = self
-        shortcutButton.action = #selector(shortcutButtonClicked)
-        shortcutButton.toolTip = "Click, then press the shortcut. ⌫ removes it, Esc cancels."
-        let shortcutRow = NSStackView(views: [shortcutTitle, shortcutButton, NSView()])
-        shortcutRow.orientation = .horizontal
-        shortcutRow.spacing = 8
-        shortcutRow.translatesAutoresizingMaskIntoConstraints = false
+        let shortcutRow = makeShortcutRow(title: "Pin on top, click-through:", slot: .pin)
+        // Shortcut that makes a hidden window the active one.
+        let focusRow = makeShortcutRow(title: "Bring to front:", slot: .focus)
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("window"))
         // The single column must always span the table, whatever the panel
@@ -2086,6 +2314,7 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
         content.addSubview(label)
         content.addSubview(sliderRow)
         content.addSubview(shortcutRow)
+        content.addSubview(focusRow)
         content.addSubview(scroll)
         NSLayoutConstraint.activate([
             label.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
@@ -2098,8 +2327,10 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
             shortcutRow.topAnchor.constraint(equalTo: sliderRow.bottomAnchor, constant: 6),
             shortcutRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
             shortcutRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
-            shortcutButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
-            scroll.topAnchor.constraint(equalTo: shortcutRow.bottomAnchor, constant: 8),
+            focusRow.topAnchor.constraint(equalTo: shortcutRow.bottomAnchor, constant: 6),
+            focusRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            focusRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            scroll.topAnchor.constraint(equalTo: focusRow.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
@@ -2111,11 +2342,31 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
         return p
     }()
 
+    private func makeShortcutRow(title: String, slot: ShortcutSlot) -> NSStackView {
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 11)
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        let button = shortcutButtons[slot]!
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 11)
+        button.tag = slot.rawValue
+        button.target = self
+        button.action = #selector(shortcutButtonClicked(_:))
+        button.toolTip = "Click, then press the shortcut. ⌫ removes it, Esc cancels."
+        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 110).isActive = true
+        let row = NSStackView(views: [label, button, NSView()])
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
+
     func show() {
         panel.orderFront(nil)
         transparencySlider.doubleValue = Double(transparency())
         updateTransparencyLabel()
-        updateShortcutButton()
+        updateShortcutButtons()
         refresh()
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
@@ -2135,13 +2386,15 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
 
     // MARK: shortcut recording
 
-    private var isRecording: Bool { recordingMonitor != nil }
-
-    @objc private func shortcutButtonClicked() {
-        if isRecording { stopRecording() } else { startRecording() }
+    @objc private func shortcutButtonClicked(_ sender: NSButton) {
+        guard let slot = ShortcutSlot(rawValue: sender.tag) else { return }
+        let wasRecordingThis = recordingSlot == slot
+        stopRecording()                       // also ends the other slot's recording
+        if !wasRecordingThis { startRecording(slot) }
     }
 
-    private func startRecording() {
+    private func startRecording(_ slot: ShortcutSlot) {
+        recordingSlot = slot
         onRecordingShortcut(true)
         // A non-activating panel can still take keyboard focus — without
         // pulling the presented app out of the foreground.
@@ -2150,20 +2403,21 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
             self?.record(event)
             return nil   // swallow: nothing else should react while recording
         }
-        updateShortcutButton()
+        updateShortcutButtons()
     }
 
     private func record(_ event: NSEvent) {
+        guard let slot = recordingSlot else { return }
         let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
         switch Int(event.keyCode) {
         case kVK_Escape:
             stopRecording()
         case kVK_Delete where flags.isEmpty, kVK_ForwardDelete where flags.isEmpty:
-            _ = onPinShortcutChange(nil)
+            _ = onShortcutChange(slot, nil)
             stopRecording()
         default:
             // Plain keys would hijack normal typing system-wide.
-            guard let shortcut = KeyShortcut(event: event), onPinShortcutChange(shortcut) else {
+            guard let shortcut = KeyShortcut(event: event), onShortcutChange(slot, shortcut) else {
                 NSSound.beep()
                 return   // keep listening for a usable combination
             }
@@ -2175,12 +2429,15 @@ final class WindowPickerController: NSObject, NSTableViewDataSource, NSTableView
         guard let monitor = recordingMonitor else { return }
         NSEvent.removeMonitor(monitor)
         recordingMonitor = nil
+        recordingSlot = nil
         onRecordingShortcut(false)
-        updateShortcutButton()
+        updateShortcutButtons()
     }
 
-    private func updateShortcutButton() {
-        shortcutButton.title = isRecording ? "Type shortcut…" : (pinShortcut()?.display ?? "Set Shortcut")
+    private func updateShortcutButtons() {
+        for (slot, button) in shortcutButtons {
+            button.title = recordingSlot == slot ? "Type shortcut…" : (shortcut(slot)?.display ?? "Set Shortcut")
+        }
     }
 
     // MARK: list
